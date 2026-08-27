@@ -290,6 +290,11 @@ def rebuild_catalog():
     sconn.close()
     n = 0
     for t in threads:
+        # 跳过归档线程：侧边栏 catalog 只应包含未归档会话。
+        # 若把 archived=1 也全量插入，App 会把归档历史全部显示出来，
+        # 点击时校验发现是归档又逐个清除 —— 表现为"点一下自动消失"的幽灵记录。
+        if t.get("archived"):
+            continue
         seq += 1
         display = t.get("title") or t.get("name") or t.get("first_user_message") or t["id"]
         src_kind = "cli" if t.get("source") in ("cli", "exec", "unknown", None) else str(t.get("source"))

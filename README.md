@@ -38,7 +38,7 @@ $ ./codex-migrate.sh old-provider
 | 1 | Rollout files (`~/.codex/sessions|archived_sessions/rollout-*.jsonl`) | Rewrite every structured `model_provider` occurrence: the first `session_meta` line, *resumed* `session_meta` lines appended mid-file, and each turn's `thread_settings.model_provider_id`. Historical text (e.g. error messages containing provider URLs) is left untouched |
 | 2 | `state_5.sqlite` → `threads` | Update provider for matching rows, backfill missing rows from rollout files |
 | 3 | `session_index.jsonl` | Rebuild with every thread (merge, never delete) |
-| 4 | `sqlite/codex-dev.db` → `local_thread_catalog` | Rebuild the sidebar catalog (with `observation_sequence`) |
+| 4 | `sqlite/codex-dev.db` → `local_thread_catalog` | Rebuild the sidebar catalog (with `observation_sequence`). **Archived threads (`archived=1`) are excluded** — inserting them into the catalog makes the sidebar show stale "ghost" entries that disappear on click |
 
 Every run **auto-backs up** to `~/codex-migration-backup/codex-backup-<timestamp>.tar.gz` (config, auth, SQLite files + all rollout files). Restore with:
 
