@@ -65,6 +65,10 @@ Your rollout files are fine — the ChatGPT/Codex app re-writes stale provider v
 
 This heals the stale `threads` rows without touching your rollout files. If the same thread breaks again, the app was running during the previous run — the pre-check blocks this by default, so always quit the app before migrating.
 
+**Archived sessions reappear in the sidebar after migrating**
+
+Threads whose rollout lives in `archived_sessions/` but whose `archived` flag was lost (e.g. backfilled as `archived=0`) show up as ghost entries. The script now auto-heals this every run: any `threads` row with `rollout_path` containing `archived_sessions` is forced back to `archived=1` before the catalog rebuild, and archived rows are never inserted into the sidebar catalog.
+
 ## Install
 
 ```bash

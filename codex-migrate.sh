@@ -135,17 +135,30 @@ def find_rollouts():
     return out
 
 def rid_from_path(p):
+    """文件名兜底解析。只用于无法读取文件内容时的最后手段。"""
     parts = os.path.basename(p).replace("rollout-", "").replace(".jsonl", "").split("-")
     return "-".join(parts[-5:]) if len(parts) >= 5 else "-".join(parts)
 
+def session_id_from_meta(obj):
+    """会话 id 以文件内容 session_meta.session_id 为准。
+    关键：Codex Desktop 的续传/分叉（rollout-<ts>-<父uuid>_<forkuuid>.jsonl）文件内的
+    session_id 仍是父会话 id —— App 把它们视为同一会话的不同内容文件。
+    若按文件名解析会把 fork 误当成独立线程，重建 catalog 后侧边栏出现"幽灵会话"（裸 ID 条目）。"""
+    sid = (obj.get("payload") or {}).get("session_id")
+    return sid if isinstance(sid, str) and sid else None
+
 def scan():
-    info = {}
+    """返回按文件展开的记录列表（rewrite 需逐文件处理）。rid = 内容归属的会话 id。"""
+    info = []
     for f in find_rollouts():
-        rid = rid_from_path(f)
+        rec = {"path": f}
         try:
             with open(f, encoding="utf-8") as fh:
                 lines = fh.readlines()
             obj = json.loads(lines[0])
+            rec["rid"] = session_id_from_meta(obj) or rid_from_path(f)
+            rec["provider"] = obj.get("payload", {}).get("model_provider")
+            rec["meta"] = obj.get("payload", {})
             inner = set()
             for line in lines[1:]:               # 内部字段也可能记录旧 provider（续传追加的 session_meta / thread_settings）
                 try:
@@ -160,10 +173,10 @@ def scan():
                 ts = p.get("thread_settings")
                 if isinstance(ts, dict) and ts.get("model_provider_id"):
                     inner.add(ts["model_provider_id"])
-            info[rid] = {"path": f, "provider": obj.get("payload", {}).get("model_provider"),
-                         "meta": obj.get("payload", {}), "inner": inner}
+            rec["inner"] = inner
         except Exception as e:
-            info[rid] = {"path": f, "provider": None, "meta": None, "error": str(e)}
+            rec.update({"rid": rid_from_path(f), "provider": None, "meta": None, "error": str(e)})
+        info.append(rec)
     return info
 
 def fix_provider(obj, olds, target):
@@ -219,24 +232,35 @@ def load_threads(conn):
 
 def upsert_thread(conn, t):
     cur = conn.cursor()
+    archived = 1 if (t.get("archived") or os.sep + "archived_sessions" + os.sep in t["rollout_path"]) else 0
     cur.execute(
         """INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider,
-           cwd, cli_version, title, created_at_ms, updated_at_ms, thread_source, sandbox_policy, approval_mode)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           cwd, cli_version, title, created_at_ms, updated_at_ms, thread_source, sandbox_policy, approval_mode, archived)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
              model_provider=excluded.model_provider, rollout_path=excluded.rollout_path,
              updated_at=excluded.updated_at, updated_at_ms=excluded.updated_at_ms""",
         (t["id"], t["rollout_path"], t["created_at"], t["updated_at"], t["source"],
          t["model_provider"], t.get("cwd") or "", t.get("cli_version") or "", t.get("title", ""),
          t["created_at_ms"], t["updated_at_ms"], t.get("thread_source"),
-         t.get("sandbox_policy", '{"type":"read-only"}'), t.get("approval_mode", "on-request")))
+         t.get("sandbox_policy", '{"type":"read-only"}'), t.get("approval_mode", "on-request"), archived))
     conn.commit()
 
 def backfill(conn, info, target):
+    """为缺失的会话回填 threads 行。每个会话选"最新文件"（mtime 最大）作为 rollout_path，
+    归档标志按该文件所在目录推断。info 为按文件展开的记录列表。"""
     existing = {t["id"] for t in load_threads(conn)}
+    best = {}
+    for i in info:
+        if i.get("error") or not i.get("meta") or not i.get("rid"):
+            continue
+        rid = i["rid"]
+        cur = best.get(rid)
+        if cur is None or os.path.getmtime(i["path"]) > os.path.getmtime(cur["path"]):
+            best[rid] = i
     added = 0
-    for rid, i in info.items():
-        if rid in existing or i.get("error") or not i.get("meta"):
+    for rid, i in best.items():
+        if rid in existing:
             continue
         ms = parse_iso_ms(i["meta"].get("timestamp"))
         if ms is None:
@@ -245,7 +269,8 @@ def backfill(conn, info, target):
                              "updated_at": ms // 1000, "created_at_ms": ms, "updated_at_ms": ms,
                              "source": "cli", "model_provider": i["provider"] or target,
                              "cwd": i["meta"].get("cwd"),
-                             "cli_version": i["meta"].get("cli_version"), "title": "", "thread_source": "user"})
+                             "cli_version": i["meta"].get("cli_version"), "title": "", "thread_source": "user",
+                             "archived": 1 if os.sep + "archived_sessions" + os.sep in i["path"] else 0})
         added += 1
     return added
 
@@ -325,7 +350,7 @@ if not total:
     print("未找到 rollout 文件，退出。")
     sys.exit(0)
 prov = {}
-for i in info.values():
+for i in info:
     prov[i["provider"] if i["provider"] else "(missing)"] = prov.get(i["provider"] if i["provider"] else "(missing)", 0) + 1
 print(f"rollout 文件 {total} 个: {prov}")
 
@@ -338,7 +363,7 @@ def match(i):
     if not FROM: return any(p != TARGET for p in cand)   # 全量: 所有非目标
     return bool(cand & set(FROM))             # 指定来源
 
-to_change = [i for i in info.values() if match(i)]
+to_change = [i for i in info if match(i)]
 all_old = sorted({p for i in to_change for p in ((i.get("inner") or set()) | ({i["provider"]} if i["provider"] else set()))})
 print(f"需迁移: {len(to_change)} 个（{TARGET} ← {all_old if all_old else '-'}）")
 
@@ -376,9 +401,14 @@ else:
         cur.execute(f"UPDATE threads SET model_provider=? WHERE model_provider IN ({ph})", (TARGET, *old))
         upd = cur.rowcount
 conn.commit()
+# 自愈：rollout 在 archived_sessions/ 目录但 archived 标志丢失的行，恢复 archived=1
+cur.execute("UPDATE threads SET archived=1 WHERE archived=0 AND rollout_path LIKE '%archived_sessions%'")
+healed = cur.rowcount
+conn.commit()
 added = backfill(conn, info, TARGET)
 conn.close()
-print(f"[2/4] threads 同步 {upd} 行, 回填 {added} 行")
+heal_msg = f", 归档自愈 {healed} 行" if healed else ""
+print(f"[2/4] threads 同步 {upd} 行, 回填 {added} 行{heal_msg}")
 
 # 3) session_index
 conn = connect_state()
